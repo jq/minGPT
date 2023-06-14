@@ -20,6 +20,13 @@ from mingpt.utils import CfgNode as CN
 
 class NewGELU(nn.Module):
     """
+    The Gaussian Error Linear Unit (GELU) activation function is a newer activation function that
+    has been shown to outperform ReLU in some cases. Compared to ReLU,
+    GELU has a non-zero gradient for negative inputs, which can help alleviate the dying ReLU problem
+    (where neurons can sometimes get stuck in the state where they always output 0).
+     GELU also introduces a kind of stochastic regularisation because its behaviour depends on
+     the magnitude of the input,
+     which can lead to more robust learning.
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
     Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
     """
@@ -44,6 +51,16 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
         # causal mask to ensure that attention is only applied to the left in the input sequence
+        ''' torch.tril() function generates a lower triangle matrix, and 
+        torch.ones(config.block_size, config.block_size) generates a square matrix full of ones. 
+        This means the "bias" matrix has ones on the diagonal and its lower triangle, 
+        and zeros elsewhere. This is used to mask the attention scores so that
+         each position (say, i) can only attend to previous positions 
+         (say, j where j<=i) and the current position. This ensures
+          the causality principle - future information cannot be leaked to the past.
+          register_buffer register a persistent buffer that won't be considered a model parameter.
+          view 按照指定的维度对输入进行重组，这样只要输入的seq<= block_size, 就可以保证每个位置只能attend到之前的位置 
+        '''
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
@@ -53,16 +70,46 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        '''Query (Q): It's the representation of the current word that we're focusing on.
+        consider you have the sentence "The cat sat on the mat". 
+        If "cat" is the query, keys are representations of all the words in the sentence, 
+        and values are also the same representations used to generate a new representation of "cat" 
+        based on its context.
+        If you have a tensor of shape (16, 20, 96) and you call split(32, dim=2), 
+        you get a tuple of three tensors, each of shape (16, 20, 32). 
+        '''
         q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # nh number of heads, hs head size
+        # total dim is same as input, just split.
+        # transpose is to swap the dimension of the tensor, (B,T, nh, hs) -> (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # @ operator is matrix multiplication  transpose(-2, -1) is to swap the last two dimensions
+        # so k -> (B, nh, hs, T) and then we can do matrix multiplication with q -> (B, nh, T, hs)
+        # k.size(-1) is the last dimension of k, which is hs
+        # @ 的结果越大，说明 q k 的相似度越大， div by sqrt(k.size(-1)) 是为了防止结果太大，导致softmax后梯度消失
+        # q @ k 就是对seq里面所有的token 进行两两相似度计算。也可以看做是 q里每个单词对整个seq 的所有单词做相似度计算。
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        '''
+         bias[:,:,:T,:T] == 0 is a comparison operation. It compares each element in the sliced bias tensor with 0,
+        and it will return a Boolean tensor of the same shape as bias[:,:,:T,:T] with True 
+        where the element is 0 and False elsewhere.
+        Broadcasting enables PyTorch to perform operations between tensors that wouldn't mathematically work 
+        because of their shapes. A mask of shape (1, 1, T, T) is broadcastable to a tensor of shape (B, nh, T, T)
+        '''
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # softmax on the last dimension (T) so that the scores sum to 1,
+        #  the model needs to choose which words to focus on?
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
+        # softmax变成概率后 再 和 所有单词做相似度计算，那么结果就是考虑相似度后的单词向量，
+        # 之所以三层 是为了用softmax后的概率值来加权
+        # 所以有人说NN的本质是压缩，如果用所有token的两两关系进行查表算weight, 是太大了而且死板，现在只用3*dim
+        # Transformer模型引入了位置编码（Positional Encoding）来为模型提供单词在句子中的位置信息。
+        # 位置编码是在每个单词的词嵌入向量中添加的一个特殊的向量，它根据单词的位置按照特定的规则进行计算，可以帮助模型理解句子中单词的顺序。
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
@@ -71,7 +118,8 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class Block(nn.Module):
-    """ an unassuming Transformer block """
+    """ 它通过自注意力机制来处理序列元素之间的关系，并通过MLP来处理单个元素的变换。
+    而LayerNorm和残差连接则可以帮助训练过程更加稳定。 """
 
     def __init__(self, config):
         super().__init__()
@@ -257,15 +305,20 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
+    # targets allows it to be used both training and generation
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
+        # torch.arange(0, t) gen [0, 1, 2, ..., t-1] and unsqueeze(0) gen [[0, 1, 2, ..., t-1]]
+        # if use unsqueeze(1) gen [[0], [1], [2], ..., [t-1]]
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        # Broadcasting: pos_emb is added to each row of tok_emb https://deeplizard.com/learn/video/6_33ulFDuCg
+        # rule: dim is equal or one of them is 1
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
